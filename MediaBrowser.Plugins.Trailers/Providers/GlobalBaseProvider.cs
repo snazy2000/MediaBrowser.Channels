@@ -18,13 +18,10 @@ namespace MediaBrowser.Plugins.Trailers.Providers
         {
             "regent",
             "movie-list",
-            "warnerbros.",
-            "apple.com",
             "variancefilms",
             "avideos.",
             "hd-trailers",
             "filmweb",
-            "ign.",
             "llnwd",
             "akamai",
             "vitalstream"

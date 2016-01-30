@@ -16,193 +16,156 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml;
+using System.Xml.Linq;
 using System.Xml.XPath;
+using MediaBrowser.Controller.Channels;
+using MediaBrowser.Model.Channels;
+using MediaBrowser.Model.Logging;
 using MediaBrowser.Model.Notifications;
 
 namespace PodCasts.Entities
 {
     public class RssFeed
     {
+        private readonly ILogger _logger;
 
-        public async Task<IEnumerable<BaseItem>> Refresh(IProviderManager providerManager,
+        public async Task<IEnumerable<ChannelItemInfo>> Refresh(IProviderManager providerManager,
             IHttpClient httpClient,
             string url,
             INotificationManager notificationManager,
             CancellationToken cancellationToken)
         {
-            using (XmlReader reader = new SyndicationFeedXmlReader(await httpClient.Get(url, cancellationToken).ConfigureAwait(false)))
+            var options = new HttpRequestOptions
             {
-                var feed = SyndicationFeed.Load(reader);
-
-                return await GetChildren(feed, providerManager, notificationManager, cancellationToken);
-            }
-        }
-
-        public async Task<SyndicationFeed> GetFeed(IProviderManager providerManager,
-            IHttpClient httpClient,
-            string url,
-            CancellationToken cancellationToken)
-        {
-            var response = await httpClient.Get(new HttpRequestOptions
-            {
-                CacheMode = CacheMode.Unconditional,
-                CacheLength = TimeSpan.FromHours(3),
                 Url = url,
-                CancellationToken = cancellationToken
+                CancellationToken = cancellationToken,
 
-            }).ConfigureAwait(false);
+                // Seeing some deflate stream errors
+                EnableHttpCompression = false
+            };
 
-            using (XmlReader reader = new SyndicationFeedXmlReader(response))
+            using (Stream stream = await httpClient.Get(options).ConfigureAwait(false))
             {
-                return SyndicationFeed.Load(reader);
+                using (var reader = new StreamReader(stream))
+                {
+                    XDocument document = XDocument.Parse(reader.ReadToEnd());
+                    var x = from c in document.Root.Element("channel").Elements("item") select c;
+
+                    return x.Select(CreatePodcast).Where(i => i != null);
+                }
             }
         }
 
-        private static async Task<IEnumerable<BaseItem>> GetChildren(SyndicationFeed feed, IProviderManager providerManager, INotificationManager notificationManager, CancellationToken cancellationToken)
+        private ChannelItemInfo CreatePodcast(XElement element)
         {
-            var podcasts = new List<BaseItem>();
+            var overview = GetValue(element, "description");
+            var title = GetValue(element, "title");
+            var enclosureElement = element.Element("enclosure");
+            var link = enclosureElement == null ? null : enclosureElement.Attribute("url").Value;
 
-            if (feed == null) return podcasts;
-
-            foreach (var item in feed.Items)
+            if (string.IsNullOrWhiteSpace(link))
             {
-                try
+                return null;
+            }
+
+            var pubDate = GetDateTime(element, "pubDate");
+
+            string posterUrl = null;
+
+            // itunes podcasts sometimes don't have a summary 
+            if (!string.IsNullOrWhiteSpace(overview))
+            {
+                overview = WebUtility.HtmlDecode(Regex.Replace(overview, @"<(.|\n)*?>", string.Empty));
+            }
+
+            long? runtimeTicks = null;
+
+            var itunesDuration = GetValue(element, "duration", "itunes");
+            TimeSpan runtime;
+            if (!string.IsNullOrEmpty(itunesDuration) && TimeSpan.TryParse(itunesDuration, out runtime))
+            {
+                runtimeTicks = runtime.Ticks;
+            }
+
+            string rating = null;
+            var itunesExplicit = GetValue(element, "explicit", "itunes");
+            if (string.Equals(itunesExplicit, "yes", StringComparison.OrdinalIgnoreCase))
+            {
+                rating = "R";
+            }
+            else if (string.Equals(itunesExplicit, "clean", StringComparison.OrdinalIgnoreCase))
+            {
+                rating = "R";
+            }
+
+            if (string.IsNullOrWhiteSpace(posterUrl) && !string.IsNullOrWhiteSpace(overview))
+            {
+                var match = Regex.Match(overview, @"<img src=[\""\']([^\'\""]+)", RegexOptions.IgnoreCase);
+                if (match.Groups.Count > 1)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-
-                    string path = null;
-
-                    foreach (var link in item.Links.Where(link => link.RelationshipType == "enclosure"))
-                    {
-                        path = (link.Uri.AbsoluteUri);
-                    }
-
-                    if (path == null)
-                    {
-                        Plugin.Logger.Warn("No path. Skipping...");
-                        continue;
-                    }
-
-                    var podcast = IsAudioFile(path) ? (BaseItem)new PodCastAudio { DateCreated = item.PublishDate.UtcDateTime, DateModified = item.PublishDate.UtcDateTime, Name = item.Title.Text, DisplayMediaType = "Audio" } :
-                                                        new VodCastVideo { DateCreated = item.PublishDate.UtcDateTime, DateModified = item.PublishDate.UtcDateTime, Name = item.Title.Text, DisplayMediaType = "Movie" };
-
-                    podcast.Path = path;
-                    podcast.Id = podcast.Path.GetMBId(podcast.GetType());
-                    podcasts.Add(podcast);
-
-                    // itunes podcasts sometimes don't have a summary 
-                    if (item.Summary != null && item.Summary.Text != null)
-                    {
-                        podcast.Overview = WebUtility.HtmlDecode(Regex.Replace(item.Summary.Text, @"<(.|\n)*?>", string.Empty));
-
-                        var match = Regex.Match(item.Summary.Text, @"<img src=[\""\']([^\'\""]+)", RegexOptions.IgnoreCase);
-                        if (match.Groups.Count > 1)
-                        {
-                            // this will get downloaded later if we need it
-                            (podcast as IHasRemoteImage).RemoteImagePath = match.Groups[1].Value;
-                        }
-                    }
-
-                    if (item.PublishDate != null) podcast.PremiereDate = item.PublishDate.DateTime;
-
-                    // Get values of syndication extension elements for a given namespace
-                    var iTunesNamespaceUri = "http://www.itunes.com/dtds/podcast-1.0.dtd";
-                    var yahooNamespaceUri = "http://search.yahoo.com/mrss/";
-                    var iTunesExt = item.ElementExtensions.FirstOrDefault(x => x.OuterNamespace == iTunesNamespaceUri);
-                    var yahooExt = item.ElementExtensions.FirstOrDefault(x => x.OuterNamespace == yahooNamespaceUri);
-                    var iTunesNavigator = iTunesExt != null ? new XPathDocument(iTunesExt.GetReader()).CreateNavigator() : null;
-                    var yahooNavigator = yahooExt != null ? new XPathDocument(yahooExt.GetReader()).CreateNavigator() : null;
-
-                    var iTunesResolver = iTunesNavigator != null ? new XmlNamespaceManager(iTunesNavigator.NameTable) : null;
-                    var yahooResolver = yahooNavigator != null ? new XmlNamespaceManager(yahooNavigator.NameTable) : null;
-                    if (iTunesResolver != null) iTunesResolver.AddNamespace("itunes", iTunesNamespaceUri);
-                    if (yahooResolver != null) yahooResolver.AddNamespace("media", yahooNamespaceUri);
-
-                    // Prefer this image
-                    //if (string.IsNullOrEmpty(podcast.PrimaryImagePath))
-                    {
-                        var thumbNavigator = yahooNavigator != null ? yahooNavigator.SelectSingleNode("media:thumbnail", yahooResolver) : null;
-                        if (thumbNavigator == null && yahooNavigator != null)
-                        {
-                            // Some feeds bury them all inside a content element - try that
-                            var contentNavigator = yahooNavigator.SelectSingleNode("media:content", yahooResolver);
-                            thumbNavigator = contentNavigator.SelectSingleNode("media:thumbnail", yahooResolver);
-                        }
-
-                        var imageUrl = thumbNavigator != null ? thumbNavigator.GetAttribute("url", "") : "";
-                        if (!string.IsNullOrEmpty(imageUrl))
-                        {
-                            // This will get downloaded later if we need it...
-                            (podcast as IHasRemoteImage).RemoteImagePath = imageUrl;
-                        }
-                    }
-
-                    var explicitNavigator = iTunesNavigator != null ? iTunesNavigator.SelectSingleNode("itunes:explicit", iTunesResolver) : null;
-                    podcast.OfficialRating = explicitNavigator != null ? explicitNavigator.Value == "no" ? "None" : "R" : null;
-
-                    //if (podcast.Name.Contains("Film")) Debugger.Break();
-
-                    var durationNavigator = iTunesNavigator != null ? iTunesNavigator.SelectSingleNode("itunes:duration", iTunesResolver) : null;
-
-                    var duration = durationNavigator != null ? durationNavigator.Value : String.Empty;
-                    if (!string.IsNullOrEmpty(duration))
-                    {
-                        try
-                        {
-                            podcast.RunTimeTicks = Convert.ToInt32(duration) * TimeSpan.TicksPerSecond;
-                        }
-                        catch (Exception)
-                        {
-                        } // we don't really care
-                    }
-
-                }
-                catch (Exception e)
-                {
-                    notificationManager.SendNotification(new NotificationRequest
-                    {
-                        Description = "Error refreshing podcast item " + e,
-                        Date = DateTime.Now,
-                        Level = NotificationLevel.Error,
-                        SendToUserMode = SendToUserType.Admins
-                    }, cancellationToken);
-                    Plugin.Logger.ErrorException("Error refreshing podcast item ", e);
+                    // this will get downloaded later if we need it
+                    posterUrl = match.Groups[1].Value;
                 }
             }
 
-            // TED Talks appends the same damn string on each title, fix it
-            if (podcasts.Count > 5)
+            return new ChannelItemInfo
             {
-                var common = podcasts[0].Name;
+                Name = title,
+                Overview = overview,
+                ImageUrl = posterUrl,
+                Id = link.GetMD5().ToString("N"),
+                Type = ChannelItemType.Media,
+                ContentType = ChannelMediaContentType.Podcast,
+                MediaType = !IsAudioFile(link) ? ChannelMediaType.Video : ChannelMediaType.Audio,
 
-                foreach (var video in podcasts.Skip(1))
-                {
-                    while (!video.Name.StartsWith(common))
+                MediaSources = new List<ChannelMediaInfo>
                     {
-                        if (common.Length < 2)
+                        new ChannelMediaInfo
                         {
-                            break;
-                        }
-                        common = common.Substring(0, common.Length - 1);
-                    }
+                            Path = link
+                        }  
+                    },
 
-                    if (common.Length < 2)
-                    {
-                        break;
-                    }
-                }
+                DateCreated = pubDate,
+                PremiereDate = pubDate,
 
-                if (common.Length > 2)
-                {
-                    foreach (var video in podcasts.Where(video => video.Name.Length > common.Length))
-                    {
-                        video.Name = video.Name.Substring(common.Length);
-                    }
-                }
+                RunTimeTicks = runtimeTicks,
+                OfficialRating = rating
+            };
+        }
 
+        private DateTime GetDateTime(XElement element, string name, string namespaceName = null)
+        {
+            var value = GetValue(element, name, namespaceName);
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return DateTime.MinValue;
             }
 
-            return podcasts;
+            DateTime date;
+            // Microsofts parser bailed 
+            if (!TryParseRfc3339DateTime(value, out date) && !TryParseRfc822DateTime(value, out date))
+            {
+                date = DateTime.UtcNow;
+            }
+
+            return date;
+        }
+
+        private string GetValue(XElement element, string name, string namespaceName = null)
+        {
+            if (!string.IsNullOrWhiteSpace(namespaceName))
+            {
+                var elem = element.Element(XName.Get(name, namespaceName));
+
+                return elem == null ? null : elem.Value;
+            }
+            else
+            {
+                var elem = element.Element(name);
+
+                return elem == null ? null : elem.Value;
+            }
         }
 
         /// <summary>
@@ -226,6 +189,11 @@ namespace PodCasts.Entities
 
         private static readonly Dictionary<string, string> AudioFileExtensionsDictionary = AudioFileExtensions.ToDictionary(i => i, StringComparer.OrdinalIgnoreCase);
 
+        public RssFeed(ILogger logger)
+        {
+            _logger = logger;
+        }
+
         /// <summary>
         /// Determines whether [is audio file] [the specified args].
         /// </summary>
@@ -241,108 +209,6 @@ namespace PodCasts.Entities
             }
 
             return AudioFileExtensionsDictionary.ContainsKey(extension);
-        }
-
-    }
-
-
-    /// <summary>
-    /// http://stackoverflow.com/questions/210375/problems-reading-rss-with-c-and-net-3-5 workaround datetime issues
-    /// </summary>
-    public class SyndicationFeedXmlReader : XmlTextReader
-    {
-        readonly string[] Rss20DateTimeHints = { "pubDate" };
-        readonly string[] Atom10DateTimeHints = { "updated", "published", "lastBuildDate" };
-        private bool isRss2DateTime = false;
-        private bool isAtomDateTime = false;
-
-        public SyndicationFeedXmlReader(Stream stream) : base(stream) { }
-
-        public override bool IsStartElement(string localname, string ns)
-        {
-            isRss2DateTime = false;
-            isAtomDateTime = false;
-
-            if (Rss20DateTimeHints.Contains(localname)) isRss2DateTime = true;
-            if (Atom10DateTimeHints.Contains(localname)) isAtomDateTime = true;
-
-            return base.IsStartElement(localname, ns);
-        }
-
-        /// <summary>
-        /// From Argotic MIT : http://argotic.codeplex.com/releases/view/14436
-        /// </summary>
-        private static string ReplaceRfc822TimeZoneWithOffset(string value)
-        {
-
-            //------------------------------------------------------------
-            //	Perform conversion
-            //------------------------------------------------------------
-            value = value.Trim();
-            if (value.EndsWith("UT", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}+0:00", value.TrimEnd("UT".ToCharArray()));
-            }
-            else if (value.EndsWith("UTC", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}+0:00", value.TrimEnd("UTC".ToCharArray()));
-            }
-            else if (value.EndsWith("EST", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}-05:00", value.TrimEnd("EST".ToCharArray()));
-            }
-            else if (value.EndsWith("EDT", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}-04:00", value.TrimEnd("EDT".ToCharArray()));
-            }
-            else if (value.EndsWith("CST", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}-06:00", value.TrimEnd("CST".ToCharArray()));
-            }
-            else if (value.EndsWith("CDT", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}-05:00", value.TrimEnd("CDT".ToCharArray()));
-            }
-            else if (value.EndsWith("MST", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}-07:00", value.TrimEnd("MST".ToCharArray()));
-            }
-            else if (value.EndsWith("MDT", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}-06:00", value.TrimEnd("MDT".ToCharArray()));
-            }
-            else if (value.EndsWith("PST", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}-08:00", value.TrimEnd("PST".ToCharArray()));
-            }
-            else if (value.EndsWith("PDT", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}-07:00", value.TrimEnd("PDT".ToCharArray()));
-            }
-            else if (value.EndsWith("Z", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}GMT", value.TrimEnd("Z".ToCharArray()));
-            }
-            else if (value.EndsWith("A", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}-01:00", value.TrimEnd("A".ToCharArray()));
-            }
-            else if (value.EndsWith("M", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}-12:00", value.TrimEnd("M".ToCharArray()));
-            }
-            else if (value.EndsWith("N", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}+01:00", value.TrimEnd("N".ToCharArray()));
-            }
-            else if (value.EndsWith("Y", StringComparison.OrdinalIgnoreCase))
-            {
-                return String.Format(null, "{0}+12:00", value.TrimEnd("Y".ToCharArray()));
-            }
-            else
-            {
-                return value;
-            }
         }
 
         /// <summary>
@@ -427,41 +293,80 @@ namespace PodCasts.Entities
             return DateTime.TryParseExact(value, formats, dateTimeFormat, DateTimeStyles.AssumeUniversal, out result);
         }
 
-        public override string ReadString()
+        /// <summary>
+        /// From Argotic MIT : http://argotic.codeplex.com/releases/view/14436
+        /// </summary>
+        private static string ReplaceRfc822TimeZoneWithOffset(string value)
         {
-            string dateVal = base.ReadString();
 
-            try
+            //------------------------------------------------------------
+            //	Perform conversion
+            //------------------------------------------------------------
+            value = value.Trim();
+            if (value.EndsWith("UT", StringComparison.OrdinalIgnoreCase))
             {
-                if (isRss2DateTime)
-                {
-                    MethodInfo objMethod = typeof(Rss20FeedFormatter).GetMethod("DateFromString", BindingFlags.NonPublic | BindingFlags.Static);
-                    Debug.Assert(objMethod != null);
-                    objMethod.Invoke(null, new object[] { dateVal, this });
-
-                }
-                if (isAtomDateTime)
-                {
-                    MethodInfo objMethod = typeof(Atom10FeedFormatter).GetMethod("DateFromString", BindingFlags.NonPublic | BindingFlags.Instance);
-                    Debug.Assert(objMethod != null);
-                    objMethod.Invoke(new Atom10FeedFormatter(), new object[] { dateVal, this });
-                }
+                return String.Format(null, "{0}+0:00", value.TrimEnd("UT".ToCharArray()));
             }
-            catch (TargetInvocationException)
+            else if (value.EndsWith("UTC", StringComparison.OrdinalIgnoreCase))
             {
-                DateTime date;
-                // Microsofts parser bailed 
-                if (!TryParseRfc3339DateTime(dateVal, out date) && !TryParseRfc822DateTime(dateVal, out date))
-                {
-                    date = DateTime.UtcNow;
-                }
-
-                DateTimeFormatInfo dtfi = CultureInfo.InvariantCulture.DateTimeFormat;
-                dateVal = date.ToString(dtfi.RFC1123Pattern, dtfi);
+                return String.Format(null, "{0}+0:00", value.TrimEnd("UTC".ToCharArray()));
             }
-
-            return dateVal;
-
+            else if (value.EndsWith("EST", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}-05:00", value.TrimEnd("EST".ToCharArray()));
+            }
+            else if (value.EndsWith("EDT", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}-04:00", value.TrimEnd("EDT".ToCharArray()));
+            }
+            else if (value.EndsWith("CST", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}-06:00", value.TrimEnd("CST".ToCharArray()));
+            }
+            else if (value.EndsWith("CDT", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}-05:00", value.TrimEnd("CDT".ToCharArray()));
+            }
+            else if (value.EndsWith("MST", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}-07:00", value.TrimEnd("MST".ToCharArray()));
+            }
+            else if (value.EndsWith("MDT", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}-06:00", value.TrimEnd("MDT".ToCharArray()));
+            }
+            else if (value.EndsWith("PST", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}-08:00", value.TrimEnd("PST".ToCharArray()));
+            }
+            else if (value.EndsWith("PDT", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}-07:00", value.TrimEnd("PDT".ToCharArray()));
+            }
+            else if (value.EndsWith("Z", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}GMT", value.TrimEnd("Z".ToCharArray()));
+            }
+            else if (value.EndsWith("A", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}-01:00", value.TrimEnd("A".ToCharArray()));
+            }
+            else if (value.EndsWith("M", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}-12:00", value.TrimEnd("M".ToCharArray()));
+            }
+            else if (value.EndsWith("N", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}+01:00", value.TrimEnd("N".ToCharArray()));
+            }
+            else if (value.EndsWith("Y", StringComparison.OrdinalIgnoreCase))
+            {
+                return String.Format(null, "{0}+12:00", value.TrimEnd("Y".ToCharArray()));
+            }
+            else
+            {
+                return value;
+            }
         }
 
     }

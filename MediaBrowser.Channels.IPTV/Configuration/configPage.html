@@ -8,7 +8,7 @@
 
         <div data-role="content">
             <div class="content-primary">
-                
+
                 <br />
                 <form id="IPTVConfigurationForm">
 
@@ -53,6 +53,7 @@
                                 <option value="Http">Http</option>
                                 <option value="File">File</option>
                                 <option value="Rtmp">Rtmp</option>
+                                <option value="Rtsp">Rtsp</option>
                             </select>
                         </div>
 
@@ -148,7 +149,7 @@
 
                 var page = this;
 
-                ApiClient.getPluginConfiguration(IPTVConfigurationPage.pluginUniqueId).done(function (config) {
+                ApiClient.getPluginConfiguration(IPTVConfigurationPage.pluginUniqueId).then(function (config) {
 
                     IPTVConfigurationPage.config = config;
 
@@ -205,12 +206,12 @@
                 Dashboard.showLoadingMsg();
 
 
-                ApiClient.getPluginConfiguration(IPTVConfigurationPage.pluginUniqueId).done(function (config) {
+                ApiClient.getPluginConfiguration(IPTVConfigurationPage.pluginUniqueId).then(function (config) {
                     var page = $($.mobile.activePage);
 
                     config.Bookmarks = IPTVConfigurationPage.config.Bookmarks;
 
-                    ApiClient.updatePluginConfiguration(IPTVConfigurationPage.pluginUniqueId, config).done(Dashboard.processPluginConfigurationUpdateResult);
+                    ApiClient.updatePluginConfiguration(IPTVConfigurationPage.pluginUniqueId, config).then(Dashboard.processPluginConfigurationUpdateResult);
                 });
 
                 // Disable default form submission
